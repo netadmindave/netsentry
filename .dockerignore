@@ -1,0 +1,7 @@
+.git
+.github
+unraid
+README.md
+alloy.config
+__pycache__
+*.db
