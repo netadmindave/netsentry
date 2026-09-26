@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """NetSentry scanner - builds a device / service / vulnerability inventory in SQLite.
 
-Deterministic and read-only against the network: pulls the active client list from
-the UDM Pro and runs nmap (service detection + vulners CVE matching).
+Deterministic and read-only against the network: pulls the client and device lists
+from a UniFi gateway and runs nmap (service detection + vulners CVE matching).
 No LLM is involved here; agent.py reads what this writes.
 """
+import ipaddress
 import os
 import sqlite3
 import subprocess
@@ -18,6 +19,8 @@ import yaml
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 CFG = yaml.safe_load(open(os.environ.get("NETSENTRY_CONFIG", "/config/config.yaml")))
+SC = CFG["scan"]
+NMAP_SERVICES = "/usr/share/nmap/nmap-services"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL);
@@ -32,60 +35,179 @@ CREATE TABLE IF NOT EXISTS vulns (
   ip TEXT, port INTEGER, vuln_id TEXT, vtype TEXT, cvss REAL, exploit INTEGER,
   first_seen INTEGER, last_seen INTEGER, PRIMARY KEY (ip, port, vuln_id));
 """
+# Columns added after v1. migrate() adds any that an existing database lacks.
+MIGRATIONS = {
+    "scans": {"duration_s": "INTEGER", "hosts_up": "INTEGER", "unifi_clients": "INTEGER"},
+    "hosts": {"unifi_name": "TEXT", "conn": "TEXT", "uplink": "TEXT", "essid": "TEXT",
+              "signal": "INTEGER", "is_self": "INTEGER"},
+}
+HOST_FIELDS = ["mac", "ip", "hostname", "vendor", "network", "wired",
+               "unifi_name", "conn", "uplink", "essid", "signal", "is_self"]
+RADIO = {"ng": "2.4 GHz", "na": "5 GHz", "6e": "6 GHz"}
 
 
 def log(msg):
     print(f"[scanner] {msg}", flush=True)
 
 
-def upsert_host(db, hid, mac, ip, hostname, vendor, network, wired, source, ts):
+def migrate(db):
+    db.executescript(SCHEMA)
+    for table, cols in MIGRATIONS.items():
+        have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        for col, typ in cols.items():
+            if col not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+
+
+def upsert_host(db, hid, source, ts, overwrite=(), **f):
+    """Insert or update a host. Fields in `overwrite` replace stored values even when
+    empty (UniFi's view of how a device connects is authoritative); others only fill in."""
+    cols = ",".join(HOST_FIELDS)
+    marks = ",".join("?" * len(HOST_FIELDS))
+    upd = ",".join(f"{k}=excluded.{k}" if k in overwrite else f"{k}=COALESCE(excluded.{k}, hosts.{k})"
+                   for k in HOST_FIELDS)
     db.execute(
-        """INSERT INTO hosts (id, mac, ip, hostname, vendor, network, wired, source, first_seen, last_seen)
-           VALUES (?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(id) DO UPDATE SET
-             ip       = COALESCE(excluded.ip, hosts.ip),
-             mac      = COALESCE(excluded.mac, hosts.mac),
-             hostname = COALESCE(excluded.hostname, hosts.hostname),
-             vendor   = COALESCE(excluded.vendor, hosts.vendor),
-             network  = COALESCE(excluded.network, hosts.network),
-             wired    = COALESCE(excluded.wired, hosts.wired),
-             source   = CASE WHEN instr(hosts.source, excluded.source) > 0 THEN hosts.source
-                             ELSE hosts.source || ',' || excluded.source END,
-             last_seen = excluded.last_seen""",
-        (hid, mac, ip, hostname, vendor, network, wired, source, ts, ts),
-    )
+        f"""INSERT INTO hosts (id,{cols},source,first_seen,last_seen) VALUES (?,{marks},?,?,?)
+            ON CONFLICT(id) DO UPDATE SET {upd},
+              source = CASE WHEN instr(hosts.source, excluded.source) > 0 THEN hosts.source
+                            ELSE hosts.source || ',' || excluded.source END,
+              last_seen = excluded.last_seen""",
+        [hid, *[f.get(k) for k in HOST_FIELDS], source, ts, ts])
 
 
-def unifi_clients():
-    """Active clients from the UDM Pro (all VLANs). Use a local, view-only account."""
+# ------------------------------------------------------------------ UniFi
+def unifi_data():
+    """Active clients plus UniFi devices (gateway, switches, APs). Use a local view-only account."""
     u = CFG.get("unifi")
     if not u:
-        return []
+        return [], []
+    pw = os.environ.get(u.get("password_env", "UNIFI_PASSWORD"))
+    if not pw:
+        log("UniFi configured but no password set; skipping UniFi")
+        return [], []
     s = requests.Session()
     s.verify = u.get("verify_ssl", False)
-    r = s.post(f"{u['url']}/api/auth/login",
-               json={"username": u["username"], "password": os.environ[u["password_env"]]},
-               timeout=15)
+    r = s.post(f"{u['url']}/api/auth/login", json={"username": u["username"], "password": pw}, timeout=15)
     r.raise_for_status()
-    r = s.get(f"{u['url']}/proxy/network/api/s/{u.get('site', 'default')}/stat/sta", timeout=30)
-    r.raise_for_status()
-    return r.json().get("data", [])
+    base = f"{u['url']}/proxy/network/api/s/{u.get('site', 'default')}"
+    clients = s.get(f"{base}/stat/sta", timeout=30).json().get("data", [])
+    try:
+        devices = s.get(f"{base}/stat/device", timeout=30).json().get("data", [])
+    except Exception as e:
+        log(f"UniFi device list failed ({e}); connection names will show MACs")
+        devices = []
+    return clients, devices
 
 
-def nmap_scan():
-    sc = CFG["scan"]
-    cmd = ["nmap", *sc["nmap_args"].split(), "-oX", "-"]
-    if sc.get("exclude"):
-        cmd += ["--exclude", ",".join(sc["exclude"])]
-    cmd += sc["targets"]
-    log("running: " + " ".join(cmd))
+def describe_connection(c, names):
+    """-> (conn, uplink, essid, signal) for one UniFi client."""
+    if c.get("is_wired"):
+        sw = names.get((c.get("sw_mac") or "").lower()) or c.get("last_uplink_name") or c.get("sw_mac") or "?"
+        port = c.get("sw_port")
+        return "wired", f"{sw} port {port}" if port else sw, None, None
+    ap = names.get((c.get("ap_mac") or "").lower()) or c.get("last_uplink_name") or c.get("ap_mac") or "?"
+    radio = RADIO.get(c.get("radio"), c.get("radio"))
+    return "wifi", f"{ap} ({radio})" if radio else ap, c.get("essid"), c.get("signal")
+
+
+def in_targets(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return any(a in ipaddress.ip_network(t, strict=False) for t in SC["targets"])
+    except ValueError:
+        return False
+
+
+def ingest_unifi(db, clients, devices, ts):
+    names = {(d.get("mac") or "").lower(): d.get("name") or d.get("model") or d.get("mac")
+             for d in devices if d.get("mac")}
+    ip2mac = {}
+    for d in devices:                      # the gateway, switches and APs themselves
+        mac = (d.get("mac") or "").lower()
+        if not mac or not in_targets(d.get("ip")):   # gateways often report their WAN address
+            continue
+        if d.get("ip"):
+            ip2mac[d["ip"]] = mac
+        upsert_host(db, mac, "unifi", ts, overwrite=("conn", "uplink", "essid", "signal"),
+                    mac=mac, ip=d.get("ip"), unifi_name=names[mac], vendor="Ubiquiti",
+                    conn="infrastructure", uplink=d.get("model"), wired=1)
+    for c in clients:
+        mac = (c.get("mac") or "").lower()
+        if not mac:
+            continue
+        ip = c.get("ip") or c.get("last_ip")
+        if ip:
+            ip2mac[ip] = mac
+        conn, uplink, essid, signal = describe_connection(c, names)
+        upsert_host(db, mac, "unifi", ts,
+                    overwrite=("conn", "uplink", "essid", "signal", "network", "wired"),
+                    mac=mac, ip=ip, hostname=c.get("hostname"), unifi_name=c.get("name"),
+                    vendor=c.get("oui"), network=c.get("network"), wired=int(bool(c.get("is_wired"))),
+                    conn=conn, uplink=uplink, essid=essid, signal=signal)
+    return ip2mac
+
+
+# ------------------------------------------------------------------ nmap
+def expand_ports(items):
+    out = set()
+    for item in items or []:
+        s = str(item).strip()
+        if "-" in s:
+            a, b = s.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        elif s:
+            out.add(int(s))
+    return out
+
+
+def top_tcp_ports(n):
+    """Same list as nmap --top-ports N: TCP ports ranked by open-frequency in nmap-services."""
+    ranked = []
+    with open(NMAP_SERVICES) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 3 or not parts[1].endswith("/tcp"):
+                continue
+            try:
+                ranked.append((float(parts[2]), int(parts[1].split("/")[0])))
+            except ValueError:
+                continue
+    ranked.sort(key=lambda t: -t[0])
+    out = []
+    for _, p in ranked:
+        if p not in out:
+            out.append(p)
+        if len(out) == n:
+            break
+    return set(out)
+
+
+def nmap_args():
+    args = SC["nmap_args"].split()
+    if any(a in ("--top-ports", "-F") or a.startswith("-p") for a in args):
+        return args                                   # ports chosen explicitly in nmap_args
+    ports = top_tcp_ports(int(SC.get("top_ports", 1000))) | expand_ports(SC.get("extra_ports"))
+    return args + ["-p", "T:" + ",".join(map(str, sorted(ports)))]
+
+
+def run_nmap(args, targets, exclude=None):
+    cmd = ["nmap", *args, "-oX", "-"]
+    if exclude:
+        cmd += ["--exclude", ",".join(exclude)]
+    cmd += targets
+    shown = [f"T:<{a.count(',') + 1} ports>" if a.startswith("T:") else a for a in cmd]
+    log("running: " + " ".join(shown))
     out = subprocess.run(cmd, capture_output=True, text=True, check=True,
-                         timeout=sc.get("timeout_s", 4 * 3600)).stdout
+                         timeout=SC.get("timeout_s", 4 * 3600)).stdout
     return ET.fromstring(out)
 
 
-def ingest_nmap(db, root, ip2mac, ts):
+def ingest_nmap(db, root, ip2mac, ts, force_self=False):
+    """Returns (hosts, ports, vulns, self_ips)."""
     n_hosts = n_ports = n_vulns = 0
+    self_ips = set()
     for h in root.findall("host"):
         status = h.find("status")
         if status is None or status.get("state") != "up":
@@ -98,6 +220,9 @@ def ingest_nmap(db, root, ip2mac, ts):
                 mac, vendor = a.get("addr").lower(), a.get("vendor")
         if not ip:
             continue
+        is_self = force_self or status.get("reason") == "localhost-response"
+        if is_self:
+            self_ips.add(ip)
         hn = h.find("hostnames/hostname")
         hostname = hn.get("name") if hn is not None else None
         # Other VLANs: nmap sees no MAC. Borrow UniFi's, else the last MAC we knew for this IP,
@@ -108,7 +233,8 @@ def ingest_nmap(db, root, ip2mac, ts):
             row = db.execute("SELECT mac FROM hosts WHERE ip=? AND mac IS NOT NULL "
                              "ORDER BY last_seen DESC LIMIT 1", (ip,)).fetchone()
             mac = row[0] if row else None
-        upsert_host(db, mac or f"ip:{ip}", mac, ip, hostname, vendor, None, None, "nmap", ts)
+        upsert_host(db, mac or f"ip:{ip}", "nmap", ts, mac=mac, ip=ip, hostname=hostname,
+                    vendor=vendor, is_self=1 if is_self else None)
         n_hosts += 1
 
         for p in h.findall("ports/port"):
@@ -141,41 +267,54 @@ def ingest_nmap(db, root, ip2mac, ts):
                         (ip, port, vid, (e.get("type") or "").lower(), float(e.get("cvss") or 0),
                          1 if e.get("is_exploit") == "true" else 0, ts, ts))
                     n_vulns += 1
-    return n_hosts, n_ports, n_vulns
+    return n_hosts, n_ports, n_vulns, self_ips
 
 
 def main():
-    ts = int(time.time())
+    t0 = time.time()
+    ts = int(t0)
     os.makedirs(os.path.dirname(CFG["db"]) or ".", exist_ok=True)
     db = sqlite3.connect(CFG["db"])
-    db.executescript(SCHEMA)
+    migrate(db)
 
-    ip2mac = {}
+    ip2mac, n_clients = {}, None
     try:
-        clients = unifi_clients()
-        for c in clients:
-            mac = (c.get("mac") or "").lower() or None
-            if not mac:
-                continue
-            ip = c.get("ip") or c.get("last_ip")
-            if ip:
-                ip2mac[ip] = mac
-            upsert_host(db, mac, mac, ip, c.get("name") or c.get("hostname"), c.get("oui"),
-                        c.get("network"), int(bool(c.get("is_wired"))), "unifi", ts)
-        log(f"UniFi: {len(clients)} active clients")
+        clients, devices = unifi_data()
+        ip2mac = ingest_unifi(db, clients, devices, ts)
+        n_clients = len(clients) if (clients or devices) else None
+        if n_clients is not None:
+            log(f"UniFi: {len(clients)} active clients, {len(devices)} UniFi devices")
     except Exception as e:  # keep going; nmap alone is still useful
         log(f"UniFi pull failed ({e}); continuing with nmap only")
 
+    args = nmap_args()
     try:
-        root = nmap_scan()
+        root = run_nmap(args, SC["targets"], SC.get("exclude"))
     except subprocess.CalledProcessError as e:
         log(f"nmap failed: {(e.stderr or '')[-800:]}")
         sys.exit(1)
+    h, p, v, self_ips = ingest_nmap(db, root, ip2mac, ts)
 
-    h, p, v = ingest_nmap(db, root, ip2mac, ts)
-    db.execute("INSERT INTO scans (ts) VALUES (?)", (ts,))
+    # A SYN scan of the machine you're running on misses ports published through Docker.
+    # Re-scan this host's own addresses with a normal TCP connect scan.
+    self_ips |= set(SC.get("self_ips") or [])
+    if self_ips and SC.get("self_connect_scan", True):
+        args2 = ["-sT" if a == "-sS" else a for a in args]
+        if "-sT" not in args2:
+            args2.insert(0, "-sT")
+        try:
+            _, p2, v2, _ = ingest_nmap(db, run_nmap(args2, sorted(self_ips)), ip2mac, ts, force_self=True)
+            log(f"self re-scan of {', '.join(sorted(self_ips))}: {p2} open ports")
+        except subprocess.CalledProcessError as e:
+            log(f"self re-scan failed: {(e.stderr or '')[-300:]}")
+
+    ports_now = db.execute("SELECT count(*) FROM ports WHERE last_seen=?", (ts,)).fetchone()[0]
+    vulns_now = db.execute("SELECT count(*) FROM vulns WHERE last_seen=?", (ts,)).fetchone()[0]
+    dur = int(time.time() - t0)
+    db.execute("INSERT INTO scans (ts, duration_s, hosts_up, unifi_clients) VALUES (?,?,?,?)",
+               (ts, dur, h, n_clients))
     db.commit()
-    log(f"done: {h} hosts up, {p} open ports, {v} vuln matches")
+    log(f"done in {dur // 60}m{dur % 60:02d}s: {h} hosts up, {ports_now} open ports, {vulns_now} vuln matches")
 
 
 if __name__ == "__main__":

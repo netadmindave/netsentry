@@ -8,8 +8,8 @@ autostart and update checks) and runs the jobs on cron schedules:
   LOGS_CRON   log review: agent.py --mode logs                 (default "15 * * * *"; empty = off)
   RUN_ON_START  "true" to do one full run when the container starts
 
-Manual runs:  docker exec netsentry python /app/scanner.py
-              docker exec netsentry python /app/agent.py --mode full
+Manual runs:  docker exec NetSentry python /app/scanner.py
+              docker exec NetSentry python /app/agent.py --mode full
 """
 import datetime as dt
 import os

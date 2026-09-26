@@ -21,15 +21,52 @@ scan:
   targets:
     - 192.168.1.0/24     # your LAN(s); other VLANs need a route/firewall rule from this host
   exclude: []            # add fragile IoT devices here if -sV knocks them over
+  # Ports: nmap's top N plus extra_ports (homelab apps outside the top 1000).
+  # Putting -p or --top-ports in nmap_args overrides both.
+  top_ports: 1000
+  extra_ports: [1880, 1883, 3001, 5055, 6052, 6053, 7878, 8006, 8096, 8123, 8181, 8265, 8686, 8883,
+                8989, 9091, 9443, 9696, 11434, 32400]
   # -sS needs NET_RAW; swap to -sT if raw sockets aren't available.
   # vulners sends detected product/version (CPE) strings to vulners.com.
-  nmap_args: "-sS -sV --version-light -T3 --top-ports 1000 --script vulners --script-args mincvss=5.0"
+  nmap_args: "-sS -sV --version-light -T3 --script vulners --script-args mincvss=5.0"
+  self_connect_scan: true  # re-scan this host's own IPs with -sT (SYN scans miss Docker-published ports)
+  self_ips: []             # detected automatically; list extra addresses of this host if needed
   timeout_s: 14400
 
 network_context: |
   Describe your network for the model in a few lines: gateway, servers and their roles,
   which services are exposed to the internet and how, and which VLANs are expected to
   contain IoT devices. The more accurate this is, the better the prioritisation.
+
+# Devices you have identified. match = IPs or MACs (MACs survive DHCP changes).
+# The model treats their expected services as normal; names appear in the report.
+known_devices: []
+#  - name: Office printer
+#    match: ["aa:bb:cc:dd:ee:ff"]
+#    note: IPP/JetDirect expected
+
+# Risks you have decided to accept; reported as context, not as findings.
+accepted_risks: []
+
+# Services reachable from the internet (port forwards, reverse proxy). Drives severity:
+# "critical" is only possible for a known-exploited CVE on one of these.
+internet_exposed: []
+#  - {ip: 192.168.1.10, port: 32400, name: Plex, via: reverse proxy}
+
+# CISA Known Exploited Vulnerabilities feed, cached in /data and refreshed daily.
+kev:
+  enabled: true
+  max_age_h: 24
+
+# Context attached to specific CVEs when they match. Extend as you triage.
+cve_notes:
+  CVE-2023-38408: "ssh-agent PKCS#11 forwarding bug; client-side, does not affect an SSH server"
+  CVE-2026-60002: "OpenSSH client use-after-free during host-key re-exchange; client-side only"
+  CVE-2020-1472: "Zerologon; only affects a Windows or Samba Active Directory domain controller"
+  CVE-2025-10230: "Samba AD domain controller with WINS support; not ordinary file sharing"
+
+# CVE IDs to drop from all results (false positives you have verified).
+suppress_cves: []
 
 loki:
   url: http://127.0.0.1:3100
