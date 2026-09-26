@@ -16,7 +16,7 @@ LOGS_CRON:  agent.py --mode logs (named Loki queries)    -> /data/reports (+ opt
 
 ## Install on Unraid
 Search **NetSentry** in the Apps tab, or copy the template from
-https://github.com/OWNER/unraid-templates into `/boot/config/plugins/dockerMan/templates-user/`
+https://github.com/netadmindave/unraid-templates into `/boot/config/plugins/dockerMan/templates-user/`
 and use Docker → Add Container. On first start the container writes
 `/mnt/user/appdata/netsentry/config/config.yaml` and waits; edit it and restart.
 
@@ -45,7 +45,7 @@ docker logs -f netsentry
 - CVE matches are based on version strings and include false positives; verify before acting.
 
 ## Development
-Pushing to `main` builds `ghcr.io/OWNER/netsentry:latest` via GitHub Actions; a weekly
+Pushing to `main` builds `ghcr.io/netadmindave/netsentry:latest` via GitHub Actions; a weekly
 scheduled rebuild picks up base-image and nmap security fixes.
 
 ## License
