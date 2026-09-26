@@ -1,0 +1,65 @@
+db: /data/netsentry.db
+reports_dir: /data/reports
+max_tool_chars: 6000     # per tool result; sized for 32K context
+max_rounds: 6            # tool-call rounds before the model is forced to write
+
+ollama:
+  url: http://127.0.0.1:11434   # host network on Unraid
+  model: qwen3:14b
+  num_ctx: 32768         # fits with OLLAMA_FLASH_ATTENTION=1 + OLLAMA_KV_CACHE_TYPE=q8_0
+  think: false
+  timeout_s: 900
+
+unifi:                   # use a LOCAL, VIEW-ONLY UniFi OS account created just for this
+  url: https://192.168.1.1
+  username: netsentry-ro
+  password_env: UNIFI_PASSWORD
+  site: default
+  verify_ssl: false
+
+scan:
+  targets:
+    - 192.168.1.0/24     # your LAN(s); other VLANs need a route/firewall rule from this host
+  exclude: []            # add fragile IoT devices here if -sV knocks them over
+  # -sS needs NET_RAW; swap to -sT if raw sockets aren't available.
+  # vulners sends detected product/version (CPE) strings to vulners.com.
+  nmap_args: "-sS -sV --version-light -T3 --top-ports 1000 --script vulners --script-args mincvss=5.0"
+  timeout_s: 14400
+
+network_context: |
+  Describe your network for the model in a few lines: gateway, servers and their roles,
+  which services are exposed to the internet and how, and which VLANs are expected to
+  contain IoT devices. The more accurate this is, the better the prioritisation.
+
+loki:
+  url: http://127.0.0.1:3100
+  auto_queries:          # always run and handed to the model up front
+    - npm_errors_by_client
+    - ha_auth_failures
+    - gateway_threats
+  queries:               # the model may call any of these by name; it never writes LogQL itself
+    npm_errors_by_client:
+      type: instant
+      logql: 'topk(15, sum by (client, vhost, status) (count_over_time({job="npm"} | regexp `\] \S+ \S+ (?P<status>\d{3}) - \S+ \S+ (?P<vhost>\S+) ".*\[Client (?P<client>[^\]]+)\]` | status >= 400 [24h])))'
+    npm_requests_by_vhost:
+      type: instant
+      logql: 'sum by (vhost) (count_over_time({job="npm"} | regexp `\] \S+ \S+ \d{3} - \S+ \S+ (?P<vhost>\S+) "` [24h]))'
+    ha_auth_failures:
+      type: range
+      hours: 24
+      logql: '{job="homeassistant"} |~ "(?i)invalid authentication|login attempt"'
+    gateway_threats:
+      type: range
+      hours: 24
+      logql: '{job="syslog"} |~ "(?i)ips alert|threat|intrusion|blocked"'
+    ssh_failures:
+      type: range
+      hours: 24
+      logql: '{job="syslog"} |~ "Failed password|Invalid user|authentication failure"'
+    dns_top_blocked_clients:
+      type: instant
+      logql: 'topk(10, sum by (client) (count_over_time({job="adguard"} | json client="IP", filtered="Result.IsFiltered" | filtered = "true" [24h])))'
+
+notify:
+  webhook: ""                  # optional: e.g. a Node-RED http-in or Home Assistant webhook URL
+  min_severity: low
