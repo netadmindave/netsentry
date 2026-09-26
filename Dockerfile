@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="NetSentry" \
       org.opencontainers.image.description="Network inventory, CVE matching and log review with a local Ollama model" \
-      org.opencontainers.image.source="https://github.com/OWNER/netsentry"
+      org.opencontainers.image.source="https://github.com/netadmindave/netsentry"
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends nmap tini tzdata ca-certificates \
